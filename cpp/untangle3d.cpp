@@ -1,12 +1,48 @@
 #include <iostream>
 #include <limits>
 #include <cassert>
-#include <cstring>
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <sstream>
+#include <iomanip>
+#include <fstream>
+#include <vector>
+#include <string>
 
 #include <ultimaille/all.h>
+#pragma omp declare reduction(vec_double_plus : std::vector<double> : \
+        std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<double>())) \
+        initializer(omp_priv = std::vector<double>(omp_orig.size(), 0))
 
 using namespace UM;
+
+#define EPS_FROM_THE_THEOREM 0
+
+template <typename T> T square(T &number) { return number * number; }
+
+void get_bbox(const PointSet &pts, vec3 &min, vec3 &max) {
+    min = max = pts[0];
+    for (auto const &p : pts) {
+        for (int d : range(3)) {
+            min[d] = std::min(min[d], p[d]);
+            max[d] = std::max(max[d], p[d]);
+        }
+    }
+}
+
+double tet_volume(const vec3 &A, const vec3 &B, const vec3 &C, const vec3 &D) {
+    return ((A-D)*cross(B-D, C-D))/6.;
+}
+
+double tet_volume(const Tetrahedra &m, const int t) {
+    return tet_volume(
+            m.points[m.vert(t, 0)],
+            m.points[m.vert(t, 1)],
+            m.points[m.vert(t, 2)],
+            m.points[m.vert(t, 3)]
+            );
+}
 
 inline double chi(double eps, double det) {
     if (det>0)
@@ -19,38 +55,50 @@ inline double chi_deriv(double eps, double det) {
 }
 
 struct Untangle3D {
-    Untangle3D(Tetrahedra &mesh) : m(mesh), X(m.nverts()*3), lock(m.points, false), J(m), K(m), det(m), ref_tet(m), volume(m) {
-        for (int t : cell_iter(m)) {
-            volume[t] = m.util.cell_volume(t);
-#if 1
-            mat<3,3> ST = {{
-                m.points[m.vert(t, 1)] - m.points[m.vert(t, 0)],
-                m.points[m.vert(t, 2)] - m.points[m.vert(t, 0)],
-                m.points[m.vert(t, 3)] - m.points[m.vert(t, 0)]
-            }};
-#else
+    Untangle3D(Tetrahedra &mesh, const std::vector<int>& locked_points = {}) : m(mesh), X(m.nverts()*3), lock(m.points), J(m), K(m), det(m) {
+        // Initialize all points as unlocked
+        for (int v : vert_iter(m))
+            lock[v] = false;
+            
+        // Lock specified points
+        for (int v : locked_points) {
+            if (v >= 0 && v < m.nverts()) {
+                lock[v] = true;
+            }
+        }
+        
+        scale();
+        { // prepare the reference tetrahedron
+            double volume = 0;
+            for (int c : cell_iter(m)) {
+                volume += tet_volume(m, c);
+            }
+            volume /= m.ncells();
+            if (debug>0) std::cerr << "avg volume: " << volume << std::endl;
+
             Tetrahedra R; // regular tetrahedron with unit edge length, centered at the origin (sqrt(2)/12 volume)
-            R.cells = {0,1,2,3};
             *R.points.data = {
                 { .5,   0, -1./(2.*std::sqrt(2.))},
                 {-.5,   0, -1./(2.*std::sqrt(2.))},
-                {  0, -.5,  1./(2.*std::sqrt(2.))},
-                {  0,  .5,  1./(2.*std::sqrt(2.))}
+                {  0,  .5,  1./(2.*std::sqrt(2.))},
+                {  0, -.5,  1./(2.*std::sqrt(2.))}
             };
-            double a = std::cbrt(volume[t]*6.*std::sqrt(2.));
+            R.cells = {0,1,2,3};
+
+            double a = std::cbrt(volume*6.*std::sqrt(2.));
             for (vec3 &p : R.points) // scale the tet
                 p = p*a;
-            mat<3,3> ST = {{
-                R.points[1] - R.points[0],
-                R.points[2] - R.points[0],
-                R.points[3] - R.points[0]
-            }};
-#endif
-            ref_tet[t] = mat<4,3>{{ {-1,-1,-1},{1,0,0},{0,1,0},{0,0,1} }}*ST.invert_transpose();
+
+            for (int lf : range(4)) { // prepare the data for gradient processing: compute the normal vectors
+                vec3 e0 = R.points[R.facet_vert(0, lf, 1)] - R.points[R.facet_vert(0, lf, 0)];
+                vec3 e1 = R.points[R.facet_vert(0, lf, 2)] - R.points[R.facet_vert(0, lf, 0)];
+                ref_tet[lf] = -(cross(e0, e1)/2.)/(3.*volume);
+            }
         }
     }
 
-    void lock_boundary_verts() {
+    // Lock boundary vertices (previously done in constructor)
+    void lock_boundary_vertices() {
         VolumeConnectivity vec(m);
         for (int c : cell_iter(m))
             for (int lf : range(4))
@@ -59,7 +107,36 @@ struct Untangle3D {
                         lock[m.facet_vert(c, lf, lv)] = true;
     }
 
+    // Get the number of locked vertices
+    int get_locked_count() const {
+        int count = 0;
+        for (int v : vert_iter(m))
+            if (lock[v]) count++;
+        return count;
+    }
+
+    // normalize the mesh, place it well inside the [0,boxside]^2 square (max size will be boxside/shrink)
+    void scale() {
+        get_bbox(m.points, bbmin, bbmax);
+        double maxside = std::max(bbmax.x-bbmin.x, bbmax.y-bbmin.y);
+        for (vec3 &p : m.points)
+            p = (p - (bbmax+bbmin)/2.)*boxsize/(shrink*maxside) + vec3(1,1,1)*boxsize/2;
+
+        for (int v : vert_iter(m))
+            for (int d : range(3))
+                X[v*3+d] = m.points[v][d];
+    }
+
+    void restore_scale() {
+        double maxside = std::max(bbmax.x-bbmin.x, bbmax.y-bbmin.y);
+        for (int v : vert_iter(m)) {
+            vec3 p = { X[v*3+0], X[v*3+1], X[v*3+2] };
+            m.points[v] = (p - vec3(1,1,1)*boxsize/2)*shrink/boxsize*maxside +  (bbmax+bbmin)/2.;
+        }
+    }
+
     void evaluate_jacobian(const std::vector<double> &X) {
+        if (debug>3) std::cerr << "evaluate the jacobian...";
         detmin = std::numeric_limits<double>::max();
         ninverted = 0;
 #pragma omp parallel for reduction(min:detmin) reduction(+:ninverted)
@@ -68,12 +145,13 @@ struct Untangle3D {
             J = {};
             for (int i=0; i<4; i++)
                 for (int d : range(3))
-                    J[d] += ref_tet[c][i]*X[3*m.vert(c,i) + d];
+                    J[d] += ref_tet[i]*X[3*m.vert(c,i) + d];
             det[c] = J.det();
             detmin = std::min(detmin, det[c]);
             ninverted += (det[c]<=0);
 
-            this->K[c] = { // dual basis
+            mat<3,3> &K = this->K[c];
+            K = { // dual basis
                 {{
                      J[1].y*J[2].z - J[1].z*J[2].y,
                      J[1].z*J[2].x - J[1].x*J[2].z,
@@ -91,21 +169,42 @@ struct Untangle3D {
                 }}
             };
         }
+        if (debug>3) std::cerr << "ok" << std::endl;
     }
 
-    bool go() {
-        std::vector<SpinLock> spin_locks(X.size());
-        eps = 1.;
+    double evaluate_energy(const std::vector<double> &X) {
         evaluate_jacobian(X);
-        if (debug>0) std::cerr <<  "number of inverted elements: " << ninverted << std::endl;
+        double E = 0;
+#pragma omp parallel for reduction(+:E)
+        for (int c=0; c<m.ncells(); c++) {
+            double chi_ = chi(eps, det[c]);
+            double f = (J[c][0]*J[c][0] + J[c][1]*J[c][1] + J[c][2]*J[c][2])/pow(chi_, 2./3.);
+            double g = (1+square(det[c]))/chi_;
+            E += (1-theta)*f + theta*g;
+        }
+        return E;
+    }
+
+    bool go(int maxiter = 10000) {
+        evaluate_jacobian(X);
+#if EPS_FROM_THE_THEOREM
+        eps = 1.;
+#else
+        double e0 = 1e-3;
+#endif
+
         for (int iter=0; iter<maxiter; iter++) {
             if (debug>0) std::cerr << "iteration #" << iter << std::endl;
+#if !EPS_FROM_THE_THEOREM
+            if (iter && iter%10==0 && e0>1e-8) e0 /= 2.;
+            eps = detmin>0 ? e0 : std::sqrt(square(e0) + 0.04*square(detmin));
+#endif
+            if (debug>0) std::cerr << "E: " << evaluate_energy(X) << " eps: " << eps << " detmin: " << detmin << " ninv: " << ninverted << std::endl;
 
-            const LBFGS_Optimizer::func_grad_eval func = [&](const std::vector<double>& X, double& F, std::vector<double>& G) {
+            const hlbfgs_optimizer::simplified_func_grad_eval func = [&](const std::vector<double>& X, double& F, std::vector<double>& G) {
                 std::fill(G.begin(), G.end(), 0);
-                F = 0;
-                evaluate_jacobian(X);
-#pragma omp parallel for reduction(+:F)
+                F = evaluate_energy(X);
+#pragma omp parallel for reduction(vec_double_plus:G)
                 for (int t=0; t<m.ncells(); t++) {
                     mat<3,3> &a = this->J[t]; // tangent basis
                     mat<3,3> &b = this->K[t]; // dual basis
@@ -114,8 +213,7 @@ struct Untangle3D {
                     double c3 = chi_deriv(eps, det[t]);
 
                     double f = (a[0]*a[0] + a[1]*a[1] + a[2]*a[2])/c2;
-                    double g = (1+det[t]*det[t])/c1;
-                    F += ((1-theta)*f + theta*g)*volume[t];
+                    double g = (1+square(det[t]))/c1;
 
                     for (int dim : range(3)) {
                         vec3 dfda = a[dim]*(2./c2) - b[dim]*((2.*f*c3)/(3.*c1));
@@ -123,37 +221,37 @@ struct Untangle3D {
 
                         for (int i=0; i<4; i++) {
                             int v = m.vert(t,i);
-                            if (lock[v]) continue;
-                            spin_locks[v*3+dim].lock();
-                            G[v*3+dim] += ((dfda*(1.-theta) + dgda*theta)*ref_tet[t][i])*volume[t];
-                            spin_locks[v*3+dim].unlock();
+                            if (!lock[v])
+                                G[v*3+dim] += (dfda*(1.-theta) + dgda*theta)*ref_tet[i];
                         }
                     }
                 }
             };
 
-            double E_prev, E;
-            std::vector<double> trash(X.size());
-            func(X, E_prev, trash);
+            double E_prev = evaluate_energy(X);
 
-            LBFGS_Optimizer opt(func);
-            opt.gtol = bfgs_threshold;
-            opt.maxiter = bfgs_maxiter;
-            opt.run(X);
+            hlbfgs_optimizer opt(func);
+            opt.set_epsg(bfgs_threshold);
+            opt.set_max_iter(bfgs_maxiter);
+            opt.set_verbose(true);
+            opt.optimize(X);
 
-            func(X, E, trash);
-            if (debug>0) std::cerr << "E: " << E << " eps: " << eps << " detmin: " << detmin << " ninv: " << ninverted << std::endl;
-
+            double E = evaluate_energy(X);
+#if EPS_FROM_THE_THEOREM
             double sigma = std::max(1.-E/E_prev, 1e-1);
-            double mu = (1-sigma)*chi(eps, detmin);
-            if (detmin<mu)
-                eps = 2*std::sqrt(mu*(mu-detmin));
-            else eps = 1e-10;
-
+            if (detmin>=0)
+                eps *= (1-sigma);
+            else
+                eps *= 1 - (sigma*std::sqrt(square(detmin) + square(eps)))/(std::abs(detmin) + std::sqrt(square(detmin) + square(eps)));
+#endif
             if  (detmin>0 && std::abs(E_prev - E)/E<1e-5) break;
         }
+
+        if (debug>0) std::cerr << "E: " << evaluate_energy(X) << " detmin: " << detmin << " ninv: " << ninverted << std::endl;
+        restore_scale();
         return !ninverted;
     }
+
 
     ////////////////////////////////
     // Untangle3D state variables //
@@ -162,11 +260,11 @@ struct Untangle3D {
     // optimization input parameters
     Tetrahedra &m;          // the mesh to optimize
     double theta = 1./2.;   // the energy is (1-theta)*(shape energy) + theta*(area energy)
-    int maxiter = 10000;    // max number of outer iterations
-    int bfgs_maxiter = 3000; // max number of inner iterations
-    double bfgs_threshold = 1e-4;
+    int bfgs_maxiter = 300; // max number of inner iterations
+    double bfgs_threshold = .1;
 
     int debug = 1;          // verbose level
+    vec3 ref_tet[4] = {};   // reference tetrahedron: array of 4 normal vectors to compute the gradients
 
     // optimization state variables
 
@@ -175,146 +273,100 @@ struct Untangle3D {
     CellAttribute<mat<3,3>> J; // per-tet Jacobian matrix = [[JX.x JX.y, JX.z], [JY.x, JY.y, JY.z], [JZ.x, JZ.y, JZ.z]]
     CellAttribute<mat<3,3>> K; // per-tet dual basis: det J = dot J[i] * K[i]
     CellAttribute<double> det; // per-tet determinant of the Jacobian matrix
-    CellAttribute<mat<4,3>> ref_tet;   // reference tetrahedron: array of 4 normal vectors to compute the gradients
-    CellAttribute<double> volume; // reference volume
     double eps;       // regularization parameter, depends on min(jacobian)
 
     double detmin;    // min(jacobian) over all tetrahedra
     int ninverted; // number of inverted tetrahedra
-};
-
-int main(int argc, char** argv) {
-    if (3>argc) {
-        std::cerr << "Usage: " << argv[0] << " init.mesh reference.mesh [result.mesh]" << std::endl;
-        return 1;
-    }
-
-    std::string res_filename = "result.mesh";
-    if (4<=argc) {
-        res_filename = std::string(argv[3]);
-    }
-
-    Tetrahedra ini, ref;
-    read_by_extension(argv[1], ini);
-    read_by_extension(argv[2], ref);
-    std::cerr << "Untangling " << argv[1] << "," << ini.nverts() << "," << std::endl;
-
-    if (ini.nverts()!=ref.nverts() || ini.ncells()!=ref.ncells()) {
-        std::cerr << "Error: " << argv[1] << " and " << argv[2] << " must have the same number of vertices and tetrahedra, aborting" << std::endl;
-        return -1;
-    }
-
-/*
-    std::vector<bool> tokill(ref.ncells(), false);
-    std::vector<std::array<int, 4>> new_cells;
-    VolumeConnectivity vec(ref);
-    for (int c : cell_iter(ref)) {
-        int cf2 = -1;
-        int cf1 = -1;
-        for (int cf : range(4)) if (vec.adjacent[4*c + cf] == -1) {
-            if (cf1 == -1) cf1 = cf;
-            else cf2 = cf;
-        }
-        if (cf2<0) continue;
-
-        int he = vec.halfedge(c, cf1, 0);
-        for (int i : range(2)) if (vec.cell_facet(vec.opposite_f(he)) != cf2) he = vec.next(he);
-
-        he = vec.prev(vec.opposite_f(vec.next(he)));
-
-        int mid = ref.nverts();
-        ref.points.push_back(0.5 * (ref.points[vec.from(he)] + ref.points[vec.to(he)]));
-        ini.points.push_back(0.5 * (ini.points[vec.from(he)] + ini.points[vec.to(he)]));
-
-        for (int he2split : vec.halfedges_around_edge(he)) {
-            tokill[vec.cell(he2split)] = true;
-            new_cells.push_back({ vec.from(he2split), vec.to(vec.next(he2split)), mid, vec.to(vec.next(vec.opposite_f(he2split))) });
-            he2split = vec.opposite_f(he2split);
-            new_cells.push_back({ vec.from(he2split), vec.to(vec.next(he2split)), mid, vec.to(vec.next(vec.opposite_f(he2split))) });
-        }
-    }
-    ref.delete_cells(tokill);
-    ini.delete_cells(tokill);
-
-    {
-        int off = ref.create_cells(new_cells.size());
-        for (int i : range(new_cells.size())) for (int lv : range(4)) ref.vert(off + i, lv) = new_cells[i][lv];
-    }
-    {
-        int off = ini.create_cells(new_cells.size());
-        for (int i : range(new_cells.size())) for (int lv : range(4)) ini.vert(off + i, lv) = new_cells[i][lv];
-    }
-
-    write_by_extension("split-rest.mesh", ref);
-    write_by_extension("split-init.mesh", ini);
-//  return 0;
-*/
-
-
-
-#if 0
-    Permutation perm(ref.nverts());
-    Permutation perm2(ref.nverts());
-    HilbertSort hs(*ref.points.data);
-    hs.apply(perm.ind);
-    perm.apply(*ref.points.data);
-    perm.apply(*ini.points.data);
-    perm.apply_reverse(perm2.ind);
-    for (int t : cell_iter(ref))
-        for (int lv : range(4))
-            ini.vert(t, lv) = ref.vert(t, lv) = perm2[ref.vert(t, lv)];
-    write_geogram("gna.geogram", ref);
-#endif
-
-
-    bool inverted = false;
-    { // ascertain the mesh requirements
-        double ref_volume = 0, ini_volume = 0;
-        for (int c : cell_iter(ref)) {
-            ref_volume += ref.util.cell_volume(c);
-            ini_volume += ini.util.cell_volume(c);
-        }
-
-        if (
-                (ref_volume<0 && ini_volume>0) ||
-                (ref_volume>0 && ini_volume<0)
-           ) {
-            std::cerr << "Error: " << argv[1] << " and " << argv[2] << " must have the orientation, aborting" << std::endl;
-            return -1;
-        }
-
-        inverted = (ini_volume<=0);
-        if (inverted) {
-            std::cerr << "Warning: the input has negative volume, inverting" << std::endl;
-            for (vec3 &p : ini.points)
-                p.x *= -1;
-            for (vec3 &p : ref.points)
-                p.x *= -1;
-        }
-    }
 
     vec3 bbmin, bbmax; // these are used to undo the scaling we apply to the model
     const double boxsize = 10.;
+    const double shrink  = 1.3;
+};
 
-    { // scale
-        ref.points.util.bbox(bbmin, bbmax);
-        double maxside = std::max(bbmax.x-bbmin.x, bbmax.y-bbmin.y);
-        for (vec3 &p : ref.points)
-            p = (p - (bbmax+bbmin)/2.)*boxsize/maxside + vec3(1,1,1)*boxsize/2;
-        for (vec3 &p : ini.points)
-            p = (p - (bbmax+bbmin)/2.)*boxsize/maxside + vec3(1,1,1)*boxsize/2;
+std::vector<int> load_locked_points_from_csv(const std::string& filename) {
+    std::vector<int> locked_points;
+    std::ifstream file(filename);
+    
+    if (!file.is_open()) {
+        std::cerr << "Warning: Could not open locked points file: " << filename << std::endl;
+        return locked_points;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip empty lines and comments (lines starting with #)
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        std::string cell;
+        
+        while (std::getline(ss, cell, ',')) {
+            try {
+                int point_id = std::stoi(cell);
+                locked_points.push_back(point_id);
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Invalid point ID in CSV: " << cell << "(" << e.what() << ")" << std::endl;
+            }
+        }
+    }
+    
+    file.close();
+    std::cerr << "Loaded " << locked_points.size() << " locked points from " << filename << std::endl;
+    return locked_points;
+}
+
+int main(int argc, char** argv) {
+    if (2>argc) {
+        std::cerr << "Usage: " << argv[0] << " input.mesh [result.mesh] [locked_points.csv]" << std::endl;
+        std::cerr << "  input.mesh: input tetrahedral mesh file (in medit/vtk format)" << std::endl;
+        std::cerr << "  result.mesh: output mesh file (default: result.mesh)" << std::endl;
+        std::cerr << "  locked_points.csv: CSV file with locked point IDs (optional)" << std::endl;
+        return 1;
+    }
+    
+    std::string res_filename = "result.mesh";
+    if (3<=argc) {
+        res_filename = std::string(argv[2]);
+    }
+    
+    std::vector<int> locked_points;
+    bool use_boundary_locking = true;
+    
+    // Check if CSV file is provided
+    if (4<=argc) {
+        std::string csv_filename = std::string(argv[3]);
+        locked_points = load_locked_points_from_csv(csv_filename);
+        use_boundary_locking = false; // Don't use boundary locking if CSV is provided
     }
 
-    Untangle3D opt(ref);
+    Tetrahedra m;
+    read_by_extension(argv[1], m);
+    std::cerr << "Untangling " << argv[1] << "," << m.nverts() << "," << std::endl;
 
-    for (int v : vert_iter(ref))
-        for (int d : range(3))
-            opt.X[3*v+d] = ini.points[v][d];
+    { // ascertain the mesh requirements
+        double volume = 0;
+        for (int c : cell_iter(m))
+            volume += tet_volume(m, c);
+        volume /= m.ncells();
+        if (volume<=0) {
+            std::cerr << "Error: the input mesh must have positive volume" << std::endl;
+            return 1;
+        }
+    }
 
-    opt.lock_boundary_verts();
+    std::cerr << "Untangle3D: start" << std::endl;
+    Untangle3D opt(m, locked_points);
+    
+    // Lock boundary vertices if no CSV file was provided
+    if (use_boundary_locking) {
+        std::cerr << "Locking boundary vertices..." << std::endl;
+        opt.lock_boundary_vertices();
+    }
+    
+    std::cerr << "Total locked vertices: " << opt.get_locked_count() << " out of " << m.nverts() << std::endl;
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    bool success = opt.go();
+    bool success = opt.go(10);
     auto t2 = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> time = t2 - t1;
 
@@ -323,21 +375,7 @@ int main(int argc, char** argv) {
     else
         std::cerr << "FAIL TO UNTANGLE!" << std::endl;
 
-    for (int v : vert_iter(ref))
-        for (int d : range(3))
-            ref.points[v][d] = opt.X[3*v+d];
-
-    { // restore scale
-        double maxside = std::max(bbmax.x-bbmin.x, bbmax.y-bbmin.y);
-        for (vec3 &p : ref.points)
-            p = (p - vec3(1,1,1)*boxsize/2)/boxsize*maxside + (bbmax+bbmin)/2.;
-    }
-
-    if (inverted)
-        for (vec3 &p : ref.points)
-            p.x *= -1;
-
-    write_by_extension(res_filename, ref, VolumeAttributes{ { {"selection", opt.lock.ptr} }, { {"det", opt.det.ptr} }, {}, {} });
+    write_by_extension(res_filename, m, VolumeAttributes{ { {"selection", opt.lock.ptr} }, { {"det", opt.det.ptr} }, {}, {} });
     return 0;
 }
 
