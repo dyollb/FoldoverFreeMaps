@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(OpenMP)
 
-find_package(VTK REQUIRED)
+find_package(VTK REQUIRED COMPONENTS vtkIOLegacy)
 if (VTK_FOUND)
   include(${VTK_USE_FILE})
   add_definitions(${VTK_DEFINITIONS})
